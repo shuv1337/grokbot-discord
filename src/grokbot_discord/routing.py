@@ -54,10 +54,16 @@ def route(
     *,
     self_user_id: str,
     default_bot: str,
+    named_only: bool = False,
 ) -> Route | None:
     if not bots:
         return None
-    roles = [b for b in bots.values() if b.role_id and b.role_id in msg.mention_role_ids]
+    # External-bot messages must resolve to the explicit leading name only.
+    roles = (
+        []
+        if named_only
+        else [b for b in bots.values() if b.role_id and b.role_id in msg.mention_role_ids]
+    )
     if len(roles) > 1:
         return None
     if len(roles) == 1:
@@ -73,6 +79,9 @@ def route(
         hit = aliases.get(_normalize_name_token(first))
         if hit is not None:
             return Route(bot=hit, text=rest.strip())
+
+    if named_only:
+        return None
 
     if default_bot and self_user_id in msg.mention_user_ids:
         bot = bots.get(default_bot) or aliases.get(default_bot.casefold())

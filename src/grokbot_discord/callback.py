@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from aiohttp import web
 from aiohttp.client_exceptions import ContentTypeError
 
-from grokbot_discord.jobs import CallbackRejected
+from grokbot_discord.jobs import CallbackNotReady, CallbackRejected
 from grokbot_discord.split import split_message
 
 log = logging.getLogger("grokbot_discord")
@@ -56,11 +56,24 @@ def build_app(secret: str, on_reply: ReplyHandler) -> web.Application:
             return web.Response(status=400, text="too many chunks")
         try:
             await on_reply(correlation_id, channel_id, message_id, text)
+        except CallbackNotReady:
+            return web.json_response(
+                {"ok": False, "error": "gateway_not_ready", "retryable": True},
+                status=503,
+                headers={"Retry-After": "5", "Cache-Control": "no-store"},
+            )
         except CallbackRejected:
-            return web.Response(status=409, text="correlation rejected")
+            return web.json_response(
+                {"ok": False, "error": "correlation_rejected", "retryable": False},
+                status=409,
+            )
         except Exception:
             log.warning("reply delivery uncertain")
-            return web.Response(status=503, text="delivery uncertain; do not repeat agent action")
+            return web.json_response(
+                {"ok": False, "error": "delivery_uncertain", "retryable": False},
+                status=503,
+                headers={"Cache-Control": "no-store"},
+            )
         return web.json_response({"ok": True, "chunks": len(chunks)})
 
     app.router.add_get("/health", health)

@@ -12,7 +12,7 @@ import discord
 from grokbot_discord.callback import build_app, start_site
 from grokbot_discord.config import ConfigError, Settings, load_settings
 from grokbot_discord.filters import Dedupe, should_drop
-from grokbot_discord.jobs import CallbackRejected, JobStore
+from grokbot_discord.jobs import CallbackNotReady, CallbackRejected, JobStore
 from grokbot_discord.models import IncomingMessage, WakePayload
 from grokbot_discord.routing import addressed_by_name, mapped_role_ids, route
 from grokbot_discord.split import split_message
@@ -116,6 +116,7 @@ class BridgeClient(discord.Client):
             self.settings.bots,
             self_user_id=self_id,
             default_bot=self.settings.default_bot,
+            named_only=msg.author_is_bot,
         )
         if hit is None:
             return
@@ -125,9 +126,6 @@ class BridgeClient(discord.Client):
             or not hit.text
             or len(hit.text) > 8000
         ):
-            return
-        # External bots must address explicitly; no role/default routing.
-        if msg.author_is_bot and not named:
             return
         correlation_id = uuid.uuid4().hex
         payload = WakePayload(
@@ -187,8 +185,11 @@ class BridgeClient(discord.Client):
             or row["author"] not in self.settings.authors | self.settings.bot_authors
         ):
             raise CallbackRejected("grant revoked")
+        # Validate targets, terminal states and duplicate content before offering a retry.
+        if self.jobs.validate_reply(correlation_id, channel_id, message_id, text) is None:
+            return
         if not self.is_ready():
-            raise RuntimeError("gateway not ready; callback may retry")
+            raise CallbackNotReady("gateway not ready")
         row = self.jobs.claim(correlation_id, channel_id, message_id, text)
         if row is None:
             return

@@ -67,3 +67,26 @@ def test_addressed_by_name(bots):
     assert not addressed_by_name("please ping loops", bots)
     assert not addressed_by_name("<@bridge> ping", bots, self_user_id="bridge")
     assert addressed_by_name("<@bridge> loops ping", bots, self_user_id="bridge")
+
+
+def test_name_only_routing_ignores_role_and_never_uses_default(bots):
+    from tests.helpers import make_msg
+
+    hit = route(
+        make_msg(content="loops <@&role-xo> do work", mention_role_ids=frozenset({"role-xo"})),
+        bots,
+        self_user_id="bridge",
+        default_bot="xo",
+        named_only=True,
+    )
+    assert hit.bot.name == "loops"
+    assert (
+        route(
+            make_msg(content="<@bridge> do work", mention_role_ids=frozenset({"role-xo"})),
+            bots,
+            self_user_id="bridge",
+            default_bot="xo",
+            named_only=True,
+        )
+        is None
+    )

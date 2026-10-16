@@ -16,6 +16,10 @@ class CallbackRejected(ValueError):
     pass
 
 
+class CallbackNotReady(RuntimeError):
+    """Retry the identical callback later: no delivery claim or send has occurred."""
+
+
 class JobStore:
     def __init__(
         self,
@@ -119,7 +123,7 @@ class JobStore:
         self.expire()
         return self.db.execute("SELECT * FROM jobs WHERE id=?", (correlation_id,)).fetchone()
 
-    def claim(self, correlation_id: str, channel: str, message: str, text: str):
+    def validate_reply(self, correlation_id: str, channel: str, message: str, text: str):
         row = self.get(correlation_id)
         digest = hashlib.sha256(text.encode()).hexdigest()
         if row is None or row["channel"] != channel or row["message"] != message:
@@ -128,6 +132,13 @@ class JobStore:
             return None
         if row["state"] not in ("waiting", "dispatching"):
             raise CallbackRejected("correlation is no longer deliverable")
+        return row
+
+    def claim(self, correlation_id: str, channel: str, message: str, text: str):
+        row = self.validate_reply(correlation_id, channel, message, text)
+        if row is None:
+            return None
+        digest = hashlib.sha256(text.encode()).hexdigest()
         with self.db:
             self.db.execute(
                 "UPDATE jobs SET state='delivering', digest=? WHERE id=?", (digest, correlation_id)

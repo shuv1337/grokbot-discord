@@ -76,11 +76,23 @@ Changing TTL affects new jobs only. A slow upstream may still execute after expi
 is rejected. Do not blindly repeat a user request after an ambiguous wake: inspect the hosted
 bot first, then obtain user intent for any new action.
 
-Callbacks can be retried with identical IDs/text after transport loss. Completed duplicates
-return 200 without delivery. Before Discord is ready, callbacks receive 503 without claiming
-jobs and may retry within TTL. Authentication failures are 401, schema/size failures 400/413,
-unknown/mismatched/revoked/expired or uncertain correlations 409. A callback delivery has a 30-second deadline. On a Discord send failure,
-503 means output may already be partially delivered. Do not rerun the agent or blindly resend.
+Callbacks can be retried with identical IDs/text after transport loss. Never rerun the agent
+because a callback failed. Responses distinguish pre-delivery recovery from uncertain output:
+
+| HTTP | JSON error / result | Caller action |
+| --- | --- | --- |
+| 200 | `ok: true` | Delivered or completed duplicate; stop. |
+| 503 | `error: gateway_not_ready`, `retryable: true`; `Retry-After: 5` | Retry only the identical callback after five seconds, within the original job TTL. No delivery claim or send occurred. |
+| 503 | `error: delivery_uncertain`, `retryable: false`; no retry header | Stop and request operator review. Output may be partial. Do not repeat work. |
+| 409 | `error: correlation_rejected`, `retryable: false` | Stop. Unknown/mismatched/revoked/expired, in-progress, changed or uncertain correlation. |
+| 401 | Authentication failure | Fix credentials through the approved secure workflow. |
+| 400/413 | Invalid schema or size | Correct the callback without repeating agent actions. |
+
+Only the typed pre-delivery readiness failure advertises a safe retry. A generic 503 is not
+permission to retry. Duplicate/terminal-state and target checks run before readiness checks,
+so an uncertain send never becomes retryable just because the Gateway disconnects. Completed
+identical duplicates return 200 even while disconnected. Delivery has a 30-second deadline;
+a timeout after claiming becomes uncertain and receives no automatic retry.
 
 The bridge commits a `delivering` claim **before** Discord sends. A crash between claim and
 send can lose output. A crash between chunks can leave partial output. Such jobs become
@@ -104,10 +116,26 @@ For shutdown use Ctrl-C/SIGTERM and wait for exit. Restart with the same config/
 reviewing any `uncertain` work. Roll back code with a normal Git checkout only after stopping;
 upstream's RAM-only runtime must not process live traffic using this pilot's guarantees.
 
+## Process lifecycle limits
+
+Run in a managed foreground terminal for local testing. One detached `nohup` launch stopped
+between health checks during verification. Its log contained only the startup banner, with no
+traceback or recorded exit status/signal; the cause could not be established. A managed terminal
+listener was then verified healthy across a conversation-turn boundary. This is evidence of
+current local liveness, not unattended durability. App/terminal closure, logout, machine restart,
+crash recovery of the running process, and automatic startup/supervision have not been validated.
+
+No persistent service, watchdog, scheduler, tunnel or restart policy has been installed or
+approved. Do not rely on the retained upstream watchdog scripts for unattended deployment.
+After approval, select a supervisor and test clean shutdown, process death, restart with the
+same database, startup after reboot, and operational health before calling it unattended-ready.
+The database recovery tests validate job semantics independently of process supervision.
+
 ## Synthetic verification
 
 Run `pytest`, Ruff, and the README HTTP harness exercise. Tests cover expiry/capacity after
-restart, persistent duplicate suppression, concurrent callbacks, exact routing targets, partial
-send uncertainty, grants, bot budgets, database ownership, redirect blocking and one-shot wake
-failures. Synthetic tests do not verify Discord permissions, actual routine payload compatibility,
+restart, persistent duplicate suppression, deliberately overlapping HTTP callbacks, exact
+routing targets, a successful first chunk followed by a failed second chunk, not-ready/ready
+HTTP recovery without another wake, external-bot name/role conflicts, grants, bot budgets,
+database ownership, redirect blocking and one-shot wake failures. Synthetic tests do not verify Discord permissions, actual routine payload compatibility,
 Grok's memory/tool isolation, external TLS/networking, or hosted provider action deduplication.

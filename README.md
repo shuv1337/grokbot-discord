@@ -50,13 +50,17 @@ the live server. No tunnel or system service is installed.
   stored target matching, current grants rechecked, unknown/expired targets rejected (409).
 - Repeated completed callbacks with identical text return success without sending again.
   In-progress, changed, expired or uncertain callbacks return 409. A send failure returns 503;
-  its job is uncertain and further sends are suppressed. Discord sends and SQLite commits
+  with `error: delivery_uncertain`, `retryable: false`; its job is uncertain and further sends
+  are suppressed. Pre-delivery Gateway unavailability instead returns `gateway_not_ready`,
+  `retryable: true` and `Retry-After: 5`, leaving the job available for an identical callback.
+  Discord sends and SQLite commits
   cannot be atomic; see the runbook for possible loss/partial output.
 - All output disables user, role, everyone, and reply mentions. At most 7600 characters and
   four chunks per reply, 8000 characters per request. Empty output is rejected; send a concise
   result instead. Embeds/link previews are not sanitized: use Discord channel settings if needed.
 - Default two outstanding jobs/channel, ten accepted wakes/channel/minute, and one accepted
-  wake/external-bot/channel/minute. External bots are off by default and must address by name.
+  wake/external-bot/channel/minute. External bots are off by default and resolve only the
+  leading name/alias; role mentions cannot override that target and defaults are unavailable.
 - Metadata only in SQLite: IDs, selected bot, timestamps, status, and reply digest. No message
   body, reply text, token, or webhook URL. Terminal records are retained seven days; 10,000
   records is a hard cap that rejects further work until retention frees space. Monitor disk.
@@ -64,6 +68,8 @@ the live server. No tunnel or system service is installed.
 
 Only one bridge process may open a state database (POSIX file lock). Keep it on local disk;
 this is not a multi-replica queue. `/health` is process liveness, not Discord/Grok readiness.
+Local foreground execution is tested; unattended startup and supervision remain unvalidated.
+See the runbook’s process lifecycle limits, including the unexplained detached-launch exit.
 
 ## Live configuration
 

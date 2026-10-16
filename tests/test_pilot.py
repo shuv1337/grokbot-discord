@@ -239,3 +239,143 @@ async def test_stalled_output_has_a_deadline(tmp_path):
     assert bridge.jobs.get("job-1")["state"] == "uncertain"
     assert bridge.jobs.reserve(payload("2"))
     await bridge.close()
+
+
+async def test_http_not_ready_then_ready_retries_callback_without_rewaking(tmp_path):
+    from unittest.mock import AsyncMock
+
+    bridge, channel = harness(tmp_path / "jobs.sqlite3")
+    bridge._wake = AsyncMock()
+    await bridge.on_message(fake_message(channel, "55"))
+    await asyncio.gather(*bridge._tasks)
+    assert bridge._wake.await_count == 1
+    correlation_id = bridge._wake.call_args.args[2].correlation_id
+    bridge.is_ready = lambda: False
+    body = dict(correlation_id=correlation_id, channel_id="200", message_id="55", text="final")
+    headers = {"Authorization": "Bearer test"}
+    async with TestClient(TestServer(build_app("test", bridge._on_callback))) as client:
+        for _ in range(2):
+            response = await client.post("/reply", json=body, headers=headers)
+            assert response.status == 503
+            assert response.headers["Retry-After"] == "5"
+            assert await response.json() == {
+                "ok": False,
+                "error": "gateway_not_ready",
+                "retryable": True,
+            }
+            assert bridge.jobs.get(correlation_id)["state"] == "dispatching"
+            assert list(channel.outbox) == ["Got it."]
+        # An invalid destination must never receive a safe-to-retry response.
+        response = await client.post("/reply", json=body | {"channel_id": "999"}, headers=headers)
+        assert response.status == 409
+        assert "Retry-After" not in response.headers
+        bridge.is_ready = lambda: True
+        response = await client.post("/reply", json=body, headers=headers)
+        assert response.status == 200
+        assert bridge.jobs.get(correlation_id)["state"] == "completed"
+        bridge.is_ready = lambda: False
+        # A completed duplicate remains successful even during disconnection.
+        assert (await client.post("/reply", json=body, headers=headers)).status == 200
+        assert list(channel.outbox) == ["Got it.", "final"]
+        assert bridge._wake.await_count == 1
+    await bridge.close()
+
+
+async def test_http_uncertain_delivery_is_explicitly_nonretryable(tmp_path):
+    bridge, channel = harness(tmp_path / "jobs.sqlite3")
+    bridge.jobs.reserve(payload())
+    sends = []
+
+    async def partial(text, **kwargs):
+        sends.append(text)
+        if len(sends) == 2:
+            raise OSError("synthetic partial failure")
+
+    channel.send = partial
+    body = dict(correlation_id="job-1", channel_id="200", message_id="1", text="a" * 2000)
+    headers = {"Authorization": "Bearer test"}
+    async with TestClient(TestServer(build_app("test", bridge._on_callback))) as client:
+        response = await client.post("/reply", json=body, headers=headers)
+        assert response.status == 503
+        assert await response.json() == {
+            "ok": False,
+            "error": "delivery_uncertain",
+            "retryable": False,
+        }
+        assert "Retry-After" not in response.headers
+        assert bridge.jobs.get("job-1")["state"] == "uncertain"
+        assert len(sends) == 2
+        bridge.is_ready = lambda: False
+        response = await client.post("/reply", json=body, headers=headers)
+        assert response.status == 409
+        assert (await response.json())["retryable"] is False
+        assert "Retry-After" not in response.headers
+        bridge.is_ready = lambda: True
+        assert (await client.post("/reply", json=body, headers=headers)).status == 409
+        assert len(sends) == 2
+    await bridge.close()
+
+
+async def test_external_bot_name_cannot_be_overridden_by_role(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    bridge, channel = harness(tmp_path / "jobs.sqlite3")
+    bridge.settings.bot_authors = {"303"}
+    original = bridge.settings.bots["pilot"]
+    alpha = replace(
+        original, name="alpha", aliases=("alpha",), role_id="500", members=frozenset({"303"})
+    )
+    beta = replace(
+        original, name="beta", aliases=("beta",), role_id="501", members=frozenset({"303"})
+    )
+    bridge.settings.bots = {"alpha": alpha, "beta": beta}
+    bridge.settings.default_bot = "beta"
+    bridge._wake = AsyncMock()
+    message = fake_message(channel, "60", "303", "alpha <@&501> do work", bot=True)
+    message.role_mentions = [SimpleNamespace(id=501)]
+    await bridge.on_message(message)
+    await asyncio.gather(*bridge._tasks)
+    assert bridge._wake.await_count == 1
+    assert bridge._wake.call_args.args[2].bot == "alpha"
+    # Role-only/default routing remains unavailable to bot authors.
+    message = fake_message(channel, "61", "303", "<@400> <@&501> do work", bot=True)
+    message.mentions = [SimpleNamespace(id=400)]
+    message.role_mentions = [SimpleNamespace(id=501)]
+    await bridge.on_message(message)
+    assert bridge._wake.await_count == 1
+    await bridge.close()
+
+
+async def test_http_overlapping_duplicate_does_not_repeat_send(tmp_path):
+    bridge, channel = harness(tmp_path / "jobs.sqlite3")
+    bridge.jobs.reserve(payload())
+    entered, release = asyncio.Event(), asyncio.Event()
+    sends = []
+
+    async def blocked_send(text, **kwargs):
+        sends.append(text)
+        entered.set()
+        await release.wait()
+
+    channel.send = blocked_send
+    body = dict(correlation_id="job-1", channel_id="200", message_id="1", text="one result")
+    headers = {"Authorization": "Bearer test"}
+    async with TestClient(TestServer(build_app("test", bridge._on_callback))) as client:
+        first = asyncio.ensure_future(client.post("/reply", json=body, headers=headers))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert bridge.jobs.get("job-1")["state"] == "delivering"
+            duplicate = await client.post("/reply", json=body, headers=headers)
+            assert duplicate.status == 409
+            assert (await duplicate.json())["retryable"] is False
+            assert not first.done()
+            assert sends == ["one result"]
+        finally:
+            release.set()
+            response = await first
+        assert response.status == 200
+        assert bridge.jobs.get("job-1")["state"] == "completed"
+        assert (await client.post("/reply", json=body, headers=headers)).status == 200
+        assert sends == ["one result"]
+    await bridge.close()
