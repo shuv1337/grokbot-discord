@@ -47,5 +47,6 @@ async def ping(
         json=req["json"],
         headers=req["headers"],
         timeout=timeout,
+        allow_redirects=False,
     ) as resp:
         return resp.status

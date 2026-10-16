@@ -11,7 +11,8 @@ import discord
 
 from grokbot_discord.callback import build_app, start_site
 from grokbot_discord.config import ConfigError, Settings, load_settings
-from grokbot_discord.filters import Dedupe, InFlight, should_drop
+from grokbot_discord.filters import Dedupe, should_drop
+from grokbot_discord.jobs import CallbackRejected, JobStore
 from grokbot_discord.models import IncomingMessage, WakePayload
 from grokbot_discord.routing import addressed_by_name, mapped_role_ids, route
 from grokbot_discord.split import split_message
@@ -19,6 +20,7 @@ from grokbot_discord.webhook import DryRunResult, ping
 
 log = logging.getLogger("grokbot_discord")
 ACK_TEXT = "Got it."
+DELIVERY_TIMEOUT_S = 30
 
 
 def _incoming(message: discord.Message) -> IncomingMessage:
@@ -32,6 +34,8 @@ def _incoming(message: discord.Message) -> IncomingMessage:
         content=message.content or "",
         mention_user_ids=frozenset(str(u.id) for u in message.mentions),
         mention_role_ids=frozenset(str(r.id) for r in message.role_mentions),
+        author_is_bot=message.author.bot,
+        webhook_id=str(message.webhook_id or ""),
     )
 
 
@@ -41,27 +45,47 @@ class BridgeClient(discord.Client):
         intents.message_content = True
         intents.guilds = True
         intents.guild_messages = True
+        kwargs["allowed_mentions"] = discord.AllowedMentions.none()
         super().__init__(intents=intents, **kwargs)
         self.settings = settings
         self.dedupe = Dedupe()
-        self.in_flight = InFlight(settings.in_flight_per_channel)
-        self.pending: dict[str, tuple[str, str]] = {}
+        self.jobs = JobStore(
+            settings.jobs_path, ttl=settings.job_ttl, capacity=settings.in_flight_per_channel
+        )
+        self._tasks: set[asyncio.Task] = set()
+        self._sweeper: asyncio.Task | None = None
         self.http_session: aiohttp.ClientSession | None = None
         self._runner = None
-        self.dry_run_log: list[dict[str, str]] = []
+        self._bridge_closed = False
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession()
+        self._sweeper = asyncio.create_task(self._expire_jobs())
         app = build_app(self.settings.callback_secret, self._on_callback)
         self._runner = await start_site(
             app, self.settings.callback_bind, self.settings.callback_port
         )
 
+    async def _expire_jobs(self) -> None:
+        while True:
+            self.jobs.expire()
+            await asyncio.sleep(5)
+
     async def close(self) -> None:
-        if self.http_session is not None:
-            await self.http_session.close()
+        if self._bridge_closed:
+            return
+        self._bridge_closed = True
+        tasks = list(self._tasks)
+        if self._sweeper:
+            tasks.append(self._sweeper)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if self._runner is not None:
             await self._runner.cleanup()
+        if self.http_session is not None:
+            await self.http_session.close()
+        self.jobs.close()
         await super().close()
 
     async def on_ready(self) -> None:
@@ -83,6 +107,7 @@ class BridgeClient(discord.Client):
             mapped_role_ids=mapped_role_ids(self.settings.bots),
             dedupe=self.dedupe,
             named=named,
+            bot_authors=self.settings.bot_authors,
         )
         if reason:
             return
@@ -93,17 +118,18 @@ class BridgeClient(discord.Client):
             default_bot=self.settings.default_bot,
         )
         if hit is None:
-            names = ", ".join(sorted(self.settings.bots))
-            await message.channel.send(f"unknown bot. configured: {names}")
             return
-        if not self.in_flight.acquire(msg.channel_id):
+        if (
+            msg.author_id not in hit.bot.members
+            or msg.channel_id not in hit.bot.channels
+            or not hit.text
+            or len(hit.text) > 8000
+        ):
             return
-        try:
-            await message.reply(ACK_TEXT, mention_author=False)
-        except Exception:
-            log.exception("ack failed for message_id=%s", msg.message_id)
+        # External bots must address explicitly; no role/default routing.
+        if msg.author_is_bot and not named:
+            return
         correlation_id = uuid.uuid4().hex
-        self.pending[correlation_id] = (msg.channel_id, msg.message_id)
         payload = WakePayload(
             bot=hit.bot.name,
             text=hit.text,
@@ -115,65 +141,78 @@ class BridgeClient(discord.Client):
             reply_url=f"{self.settings.callback_public_url}/reply",
             correlation_id=correlation_id,
         )
-        asyncio.create_task(self._wake(hit.bot.webhook_url, hit.bot.webhook_key, payload))
+        if not self.jobs.reserve(payload, bot_author=msg.author_is_bot):
+            return
+        task = asyncio.create_task(self._wake(hit.bot.webhook_url, hit.bot.webhook_key, payload))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        try:
+            await message.reply(
+                ACK_TEXT, mention_author=False, allowed_mentions=discord.AllowedMentions.none()
+            )
+        except Exception:
+            log.warning("ack failed for message_id=%s", msg.message_id)
 
     async def _wake(self, url: str, key: str, payload: WakePayload) -> None:
-        keep_pending = False
+        # No retries: even a timeout/5xx can follow an accepted agent action.
+        state = "waiting"
         try:
             if self.http_session is None:
+                state = "failed"
                 return
-            result = await ping(
-                self.http_session,
-                url,
-                key,
-                payload,
-                dry_run=self.settings.dry_run,
-            )
+            result = await ping(self.http_session, url, key, payload, dry_run=self.settings.dry_run)
             if isinstance(result, DryRunResult):
-                self.dry_run_log.append(result.payload)
-                log.info("DRY_RUN would POST webhook for bot=%s", payload.bot)
-                return
-            if result != 200:
-                log.warning("webhook wake returned %s for bot=%s", result, payload.bot)
-                return
-            keep_pending = True
-        except TimeoutError:
-            log.warning("webhook wake timed out for bot=%s", payload.bot)
-        except aiohttp.ClientError:
-            log.exception("webhook wake failed for bot=%s", payload.bot)
+                state = "completed"
+            elif not 200 <= result < 300:
+                log.warning("wake outcome unresolved status=%s bot=%s", result, payload.bot)
+        except (TimeoutError, aiohttp.ClientError):
+            # Never log exceptions containing credential-bearing webhook URLs.
+            log.warning("wake outcome unresolved bot=%s", payload.bot)
         finally:
-            if keep_pending:
-                return
-            self.in_flight.release(payload.channel_id)
-            self.pending.pop(payload.correlation_id, None)
+            self.jobs.finish_wake(payload.correlation_id, state)
 
     async def _on_callback(
         self, correlation_id: str, channel_id: str, message_id: str, text: str
     ) -> None:
-        pending = self.pending.pop(correlation_id, None)
-        ref_channel, ref_message = pending if pending else (channel_id, message_id)
+        row = self.jobs.get(correlation_id)
+        if row is None:
+            raise CallbackRejected("unknown correlation")
+        bot = self.settings.bots.get(row["bot"])
+        if (
+            bot is None
+            or row["guild"] not in self.settings.guilds
+            or row["channel"] not in self.settings.channels
+            or row["channel"] not in bot.channels
+            or row["author"] not in bot.members
+            or row["author"] not in self.settings.authors | self.settings.bot_authors
+        ):
+            raise CallbackRejected("grant revoked")
+        if not self.is_ready():
+            raise RuntimeError("gateway not ready; callback may retry")
+        row = self.jobs.claim(correlation_id, channel_id, message_id, text)
+        if row is None:
+            return
+        success = False
         try:
-            channel = self.get_channel(int(ref_channel))
-            if channel is None:
-                channel = await self.fetch_channel(int(ref_channel))
-            chunks = split_message(text)
-            reference = None
-            if ref_message:
-                try:
-                    reference = discord.MessageReference(
-                        message_id=int(ref_message),
-                        channel_id=int(ref_channel),
-                        fail_if_not_exists=False,
-                    )
-                except ValueError:
-                    reference = None
-            for i, chunk in enumerate(chunks):
-                kwargs: dict[str, Any] = {}
-                if i == 0 and reference is not None:
-                    kwargs["reference"] = reference
-                await channel.send(chunk, **kwargs)
+            async with asyncio.timeout(DELIVERY_TIMEOUT_S):
+                channel = self.get_channel(int(row["channel"]))
+                if channel is None:
+                    channel = await self.fetch_channel(int(row["channel"]))
+                if str(getattr(getattr(channel, "guild", None), "id", "")) != row["guild"]:
+                    raise CallbackRejected("destination guild mismatch")
+                reference = discord.MessageReference(
+                    message_id=int(row["message"]),
+                    channel_id=int(row["channel"]),
+                    fail_if_not_exists=False,
+                )
+                for i, chunk in enumerate(split_message(text)):
+                    kwargs: dict[str, Any] = {"allowed_mentions": discord.AllowedMentions.none()}
+                    if i == 0:
+                        kwargs["reference"] = reference
+                    await channel.send(chunk, **kwargs)
+            success = True
         finally:
-            self.in_flight.release(ref_channel)
+            self.jobs.finish_reply(correlation_id, success=success)
 
 
 def main() -> None:
@@ -183,8 +222,11 @@ def main() -> None:
     )
     try:
         settings = load_settings()
-    except ConfigError as exc:
+    except (ConfigError, ValueError) as exc:
         log.error("%s", exc)
+        sys.exit(2)
+    if settings.dry_run:
+        log.error("Use python -m grokbot_discord.synthetic for account-free testing")
         sys.exit(2)
     client = BridgeClient(settings)
     client.run(settings.discord_token)

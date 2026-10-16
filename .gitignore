@@ -10,3 +10,8 @@ dist/
 build/
 bridge.log
 
+bots.yaml
+state/
+*.sqlite3
+*.sqlite3-*
+*.log

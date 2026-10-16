@@ -1,7 +1,10 @@
-default: loops
+default: pilot
 bots:
-  loops:
-    aliases: [loops]
+  pilot:
+    aliases: [pilot]
     role_id: ""
-    webhook_url_env: GROK_BOT_LOOPS_WEBHOOK_URL
-    webhook_key_env: GROK_BOT_LOOPS_WEBHOOK_KEY
+    # Exact Discord IDs. Required; no wildcard or implicit thread inheritance.
+    members: []
+    channels: []
+    webhook_url_env: GROK_BOT_PILOT_WEBHOOK_URL
+    webhook_key_env: GROK_BOT_PILOT_WEBHOOK_KEY

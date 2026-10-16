@@ -60,6 +60,8 @@ def example_env(tmp_path: Path) -> Path:
         "bots:\n"
         "  loops:\n"
         "    aliases: [loops]\n"
+        "    members: [u1]\n"
+        "    channels: [c1]\n"
         "    role_id: ''\n"
         "    webhook_url_env: GROK_BOT_LOOPS_WEBHOOK_URL\n"
         "    webhook_key_env: GROK_BOT_LOOPS_WEBHOOK_KEY\n",

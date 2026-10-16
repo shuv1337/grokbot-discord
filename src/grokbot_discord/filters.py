@@ -62,6 +62,7 @@ def should_drop(
     mapped_role_ids: set[str],
     dedupe: Dedupe,
     named: bool = False,
+    bot_authors: set[str] | None = None,
 ) -> str | None:
     if msg.author_id == self_user_id:
         return "self"
@@ -69,7 +70,10 @@ def should_drop(
         return "guild"
     if msg.channel_id not in channels:
         return "channel"
-    if msg.author_id not in authors:
+    if msg.webhook_id:
+        return "webhook"
+    allowed_authors = (bot_authors or set()) if msg.author_is_bot else authors
+    if msg.author_id not in allowed_authors:
         return "author"
     if require_mention:
         mentioned_self = self_user_id in msg.mention_user_ids

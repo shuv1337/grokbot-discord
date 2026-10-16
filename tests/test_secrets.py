@@ -21,8 +21,10 @@ def test_examples_have_no_live_secrets():
             "false",
             "bots.yaml",
             "127.0.0.1",
-            "8787",
-            "http://127.0.0.1:8787",
+            "8898",
+            "300",
+            "state/jobs.sqlite3",
+            "http://127.0.0.1:8898",
             "2",
         }
     yaml = (ROOT / "bots.example.yaml").read_text(encoding="utf-8")

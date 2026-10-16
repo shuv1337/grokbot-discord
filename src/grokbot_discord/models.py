@@ -10,6 +10,8 @@ class BotSpec:
     role_id: str
     webhook_url: str
     webhook_key: str
+    members: frozenset[str] = frozenset()
+    channels: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -22,6 +24,8 @@ class IncomingMessage:
     content: str
     mention_user_ids: frozenset[str]
     mention_role_ids: frozenset[str]
+    author_is_bot: bool = False
+    webhook_id: str = ""
 
 
 @dataclass(frozen=True)
